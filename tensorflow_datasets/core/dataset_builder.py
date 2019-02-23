@@ -22,6 +22,7 @@ from __future__ import print_function
 import abc
 import functools
 import os
+import posixpath
 import sys
 
 from absl import logging
@@ -38,6 +39,7 @@ from tensorflow_datasets.core import registered
 from tensorflow_datasets.core import splits as splits_lib
 from tensorflow_datasets.core import units
 from tensorflow_datasets.core import utils
+from tensorflow_datasets.core.utils import gcs_utils
 
 import termcolor
 
@@ -45,6 +47,12 @@ import termcolor
 FORCE_REDOWNLOAD = download.GenerateMode.FORCE_REDOWNLOAD
 REUSE_CACHE_IF_EXISTS = download.GenerateMode.REUSE_CACHE_IF_EXISTS
 REUSE_DATASET_IF_EXISTS = download.GenerateMode.REUSE_DATASET_IF_EXISTS
+
+GCS_HOSTED_MSG = """\
+Dataset {name} is hosted on GCS. Setting data_dir to {gcs_path}. If you find
+that read performance is slow, try copying the data locally with gsutil:
+gsutil -m cp -R {gcs_path} {local_data_dir_no_version}
+"""
 
 
 class BuilderConfig(object):
@@ -188,10 +196,15 @@ class DatasetBuilder(object):
 
     download_config = download_config or download.DownloadConfig()
     data_exists = tf.io.gfile.exists(self._data_dir)
-    if (data_exists and
-        download_config.download_mode == REUSE_DATASET_IF_EXISTS):
-      logging.info("Reusing dataset %s (%s)", self.name, self._data_dir)
-      return
+    if download_config.download_mode == REUSE_DATASET_IF_EXISTS:
+      # Data exists locally
+      if data_exists:
+        logging.info("Reusing dataset %s (%s)", self.name, self._data_dir)
+        return
+
+      # Data exists on GCS
+      if self._maybe_set_gcs_data_dir():
+        return
 
     dl_manager = self._make_download_manager(
         download_dir=download_dir,
@@ -276,11 +289,15 @@ class DatasetBuilder(object):
       the entire dataset in `tf.Tensor`s instead of a `tf.data.Dataset`.
     """
     if not tf.io.gfile.exists(self._data_dir):
-      raise AssertionError(
-          ("Dataset %s: could not find data in %s. Please make sure to call "
-           "dataset_builder.download_and_prepare(), or pass download=True to "
-           "tfds.load() before trying to access the tf.data.Dataset object."
-          ) % (self.name, self._data_dir_root))
+
+      # Data may exist on our public GCS bucket
+      on_gcs = self._maybe_set_gcs_data_dir()
+      if not on_gcs:
+        raise AssertionError(
+            ("Dataset %s: could not find data in %s. Please make sure to call "
+             "dataset_builder.download_and_prepare(), or pass download=True to "
+             "tfds.load() before trying to access the tf.data.Dataset object."
+            ) % (self.name, self._data_dir_root))
 
     # By default, return all splits
     if split is None:
@@ -337,14 +354,44 @@ class DatasetBuilder(object):
     else:
       return dataset
 
+  def _maybe_set_gcs_data_dir(self):
+    """If data is on GCS, set _data_dir to GCS path."""
+    is_accessible = gcs_utils.is_gcs_dataset_accessible(
+        self._relative_data_dir(with_version=True, posix=True))
+
+    if is_accessible:
+      # Switch data_dir to be GCS
+      gcs_path = os.path.join(
+          constants.GCS_DATA_DIR, self._relative_data_dir(with_version=True))
+      logging.info(GCS_HOSTED_MSG.format(  # pylint: disable=logging-format-interpolation
+          name=self.name,
+          gcs_path=gcs_path,
+          local_data_dir_no_version=os.path.split(self._data_dir)[0]))
+      self._data_dir = gcs_path
+      return True
+    else:
+      return False
+
+  def _relative_data_dir(self, with_version=True, posix=False):
+    """Relative path of this dataset in data_dir."""
+    builder_data_dir = self.name
+    builder_config = self._builder_config
+    path_join = posixpath.join if posix else os.path.join
+    if builder_config:
+      builder_data_dir = path_join(builder_data_dir, builder_config.name)
+    if not with_version:
+      return builder_data_dir
+
+    version = self._version
+    version_data_dir = path_join(builder_data_dir, str(version))
+    return version_data_dir
+
   def _build_data_dir(self):
     """Return the data directory for the current version."""
-    builder_data_dir = os.path.join(self._data_dir_root, self.name)
-    builder_config = self._builder_config
-    if builder_config:
-      builder_data_dir = os.path.join(builder_data_dir, builder_config.name)
-    version = self._version
-    version_data_dir = os.path.join(builder_data_dir, str(version))
+    builder_data_dir = os.path.join(
+        self._data_dir_root, self._relative_data_dir(with_version=False))
+    version_data_dir = os.path.join(
+        self._data_dir_root, self._relative_data_dir(with_version=True))
 
     def _other_versions_on_disk():
       """Returns previous versions on disk."""
