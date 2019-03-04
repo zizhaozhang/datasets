@@ -82,6 +82,7 @@ DATASET_EXTRAS = {
         # route to install OpenCV
         'opencv-python==3.4.0.14'
     ],
+    'wikipedia': ['mwparserfromhell'],
 }
 
 all_dataset_extras = []
